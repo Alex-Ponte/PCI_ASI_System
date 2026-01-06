@@ -1,0 +1,243 @@
+import datetime as dt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# =========================
+# Configuration
+# =========================
+
+TICKERS = [
+    "NVDA","AAPL","MSFT","AMZN","META","AVGO","GOOGL","GOOG","TSLA",
+    "BRK-B","WMT","JPM","ORCL","LLY","V","MA","XOM","NFLX","JNJ",
+    "PLTR","COST","AMD","ABBV","BAC","HD","PG","UNH","GE","CVX",
+    "KO","IBM","CSCO","WFC","MS","AXP","MU","PM","CAT","TMUS","CRM"
+]
+
+TRAIN_YEARS = 20
+TEST_MONTHS = 9
+HORIZONS = [10, 15, 20]
+
+STD_WINDOWS = [5, 10]
+
+EMA_SPANS = [16, 20, 40]
+SMA_WINDOWS = [5, 10, 15, 20, 30]
+WMA_WINDOWS = [10, 15, 20]
+KAMA_WINDOWS = [5, 10, 15, 20, 30]
+
+KAMA_FAST = 2
+KAMA_SLOW = 30
+
+BOOTSTRAP_ITERS = 500
+BOOTSTRAP_PCTS = [5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95]
+
+# =========================
+# Helper functions
+# =========================
+
+def get_shares_outstanding(ticker):
+    try:
+        fi = getattr(ticker, "fast_info", None)
+        if fi and getattr(fi, "shares_outstanding", None):
+            shares = float(fi.shares_outstanding)
+        else:
+            shares = float(ticker.info.get("sharesOutstanding", 0))
+        return shares if shares > 0 else np.nan
+    except Exception:
+        return np.nan
+
+
+def atr14(high, low, close):
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(),
+         (high - prev_close).abs(),
+         (low - prev_close).abs()],
+        axis=1
+    ).max(axis=1)
+    return tr.rolling(14).mean()
+
+
+def compute_pci2(high, low, volume, shares):
+    if not np.isfinite(shares) or shares <= 0:
+        return pd.Series(np.nan, index=high.index)
+
+    mu = ((shares + volume) * high) / shares
+    lam = ((shares - volume) * low) / shares
+    denom = mu - lam
+
+    eps = 1e-9 * np.nanmean(np.abs(denom))
+    valid = np.isfinite(denom) & (np.abs(denom) > eps)
+
+    out = np.full(len(high), np.nan)
+    out[valid] = (high.values[valid] - low.values[valid]) / denom.values[valid]
+
+    return pd.Series(out, index=high.index)
+
+
+def wma(series, window):
+    weights = np.arange(1, window + 1)
+    def apply(x):
+        if np.isnan(x).all():
+            return np.nan
+        w = weights[-len(x):]
+        return np.dot(x, w) / w.sum()
+    return series.rolling(window, min_periods=window//2).apply(apply, raw=True)
+
+
+def kama(series, er_window, fast=2, slow=30):
+    series = series.astype(float)
+    kama = np.full(len(series), np.nan)
+
+    fast_sc = 2 / (fast + 1)
+    slow_sc = 2 / (slow + 1)
+
+    first_valid = np.where(np.isfinite(series))[0]
+    if len(first_valid) == 0:
+        return pd.Series(kama, index=series.index)
+
+    start = max(first_valid[0], er_window)
+    kama[start] = series.iloc[start-er_window:start].mean()
+
+    for t in range(start + 1, len(series)):
+        price = series.iloc[t]
+        if not np.isfinite(price):
+            kama[t] = kama[t-1]
+            continue
+
+        change = abs(price - series.iloc[t-er_window])
+        vol = np.abs(np.diff(series.iloc[t-er_window:t+1])).sum()
+        er = 0 if vol == 0 else change / vol
+
+        sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+        kama[t] = kama[t-1] + sc * (price - kama[t-1])
+
+    return pd.Series(kama, index=series.index)
+
+
+def spearman_fast(x, y):
+    s = pd.concat([x, y], axis=1).dropna()
+    if len(s) < 5:
+        return np.nan
+    return np.corrcoef(s.iloc[:,0].rank(), s.iloc[:,1].rank())[0,1]
+
+
+def bootstrap_ic(x, y, iters=500):
+    s = pd.concat([x, y], axis=1).dropna()
+    n = len(s)
+    if n < 30:
+        return np.nan, {}, np.nan
+
+    xr = s.iloc[:,0].rank().to_numpy()
+    yr = s.iloc[:,1].rank().to_numpy()
+
+    idx = np.random.randint(0, n, size=(iters, n))
+    X = xr[idx] - xr[idx].mean(axis=1, keepdims=True)
+    Y = yr[idx] - yr[idx].mean(axis=1, keepdims=True)
+
+    denom = X.std(axis=1) * Y.std(axis=1)
+    valid = denom > 0
+
+    vals = np.full(iters, np.nan)
+    vals[valid] = (X[valid] * Y[valid]).sum(axis=1) / ((n - 1) * denom[valid])
+
+    return (
+        float(np.nanmean(vals)),
+        {p: float(np.nanpercentile(vals, p)) for p in BOOTSTRAP_PCTS},
+        float(np.nanmean(vals > 0))
+    )
+
+# =========================
+# Main evaluation loop
+# =========================
+
+results = []
+
+for symbol in TICKERS:
+    try:
+        ticker = yf.Ticker(symbol)
+
+        end = dt.datetime.utcnow()
+        start = end - dt.timedelta(days=int(365.25 * TRAIN_YEARS))
+        hist = ticker.history(start=start.date(), end=end.date(), auto_adjust=True)
+
+        if hist.empty:
+            continue
+
+        df = hist.reset_index()
+        df["ret"] = df["Close"].pct_change()
+        df["abs_ret"] = df["ret"].abs()
+
+        shares = get_shares_outstanding(ticker)
+        if not np.isfinite(shares):
+            continue
+
+        df["PCI2"] = compute_pci2(df["High"], df["Low"], df["Volume"], shares)
+
+        for w in STD_WINDOWS:
+            df[f"std_{w}"] = df["ret"].rolling(w).std()
+            df[f"std_vol_ratio_{w}"] = df[f"std_{w}"] / df["Volume"]
+
+        df["ATR14"] = atr14(df["High"], df["Low"], df["Close"])
+        df["vol_z"] = (
+            (df["Volume"] - df["Volume"].rolling(20).mean()) /
+            df["Volume"].rolling(20).std()
+        )
+
+        smoothed = {}
+
+        for w in SMA_WINDOWS:
+            smoothed[f"PCI2_sma{w}"] = df["PCI2"].rolling(w).mean()
+        for w in EMA_SPANS:
+            smoothed[f"PCI2_ema{w}"] = df["PCI2"].ewm(span=w, adjust=False).mean()
+        for w in WMA_WINDOWS:
+            smoothed[f"PCI2_wma{w}"] = wma(df["PCI2"], w)
+        for w in KAMA_WINDOWS:
+            smoothed[f"PCI2_kama{w}"] = kama(df["PCI2"], w, KAMA_FAST, KAMA_SLOW)
+
+        split = int(len(df) * 0.6)
+
+        for h in HORIZONS:
+            df[f"fut_absret_{h}"] = df["Close"].pct_change(h).shift(-h).abs()
+            y = df.loc[split:, f"fut_absret_{h}"]
+
+            for name, series in smoothed.items():
+                x = series.loc[split:]
+                ic = spearman_fast(x, y)
+                boot_mean, boot_pcts, gt0 = bootstrap_ic(x, y)
+
+                results.append({
+                    "Symbol": symbol,
+                    "Horizon": h,
+                    "Score": name,
+                    "IC": ic,
+                    "IC_boot_mean": boot_mean,
+                    "IC_gt0_share": gt0
+                })
+
+    except Exception as e:
+        print(f"{symbol} failed: {e}")
+
+# =========================
+# Aggregation and output
+# =========================
+
+res = pd.DataFrame(results)
+
+summary = (
+    res.groupby(["Horizon", "Score"])
+       .agg(
+           IC_mean=("IC", "mean"),
+           IC_median=("IC", "median"),
+           IC_gt0=("IC", lambda x: (x > 0).mean()),
+           N=("IC", "count")
+       )
+       .reset_index()
+)
+
+print(summary.round(3))
+
+summary.to_excel("PCI2_scorecard.xlsx", index=False)
+res.to_csv("PCI2_fold_results.csv", index=False)
