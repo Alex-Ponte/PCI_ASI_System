@@ -1,0 +1,227 @@
+# ===============================
+# Libraries
+# ===============================
+import datetime as dt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# ===============================
+# Parameters (finalised)
+# ===============================
+TICKERS = [
+    "NVDA","AAPL","MSFT","AMZN","META","AVGO","GOOGL","GOOG","TSLA","BRK-B",
+    "WMT","JPM","ORCL","LLY","V","MA","XOM","NFLX","JNJ","PLTR","COST","AMD",
+    "ABBV","BAC","HD","PG","UNH","GE","CVX","KO","IBM","CSCO","WFC","MS",
+    "AXP","MU","PM","CAT","TMUS","CRM"
+]
+
+TRAIN_YEARS  = 20
+TEST_MONTHS  = 9
+ROLL_Q_WIN   = 252
+HORIZONS     = [10, 15, 20, 30, 40, 100]
+
+# Only WMA  after testing
+WMA_WINDOWS = [5, 10, 15, 20, 30]
+
+# Volatility baselines
+STD_ROLL_WINDOWS = [5, 10]
+
+# Diagnostics
+LIFT_QUANTILES = [0.9, 0.8, 0.7]
+STD_LIMITS = [0.0]   # full test set
+
+# Bootstrap diagnostics
+ENABLE_BOOTSTRAP = True
+BOOT_ITERS = 500
+BOOT_PCTS = [5, 25, 50, 75, 95]  # interpretable percentiles
+
+# ===============================
+# Helper functions
+# ===============================
+def get_shares_outstanding(ticker: yf.Ticker):
+    try:
+        fi = getattr(ticker, "fast_info", None)
+        if fi and getattr(fi, "shares_outstanding", None):
+            shares = float(fi.shares_outstanding)
+        else:
+            shares = float(ticker.info.get("sharesOutstanding", 0))
+        return shares if shares > 0 else np.nan
+    except Exception:
+        return np.nan
+
+
+def atr14(high, low, close):
+    prev = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev).abs(),
+        (low - prev).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(14).mean()
+
+
+def compute_pci2(high, low, vol, shares):
+    if not np.isfinite(shares) or shares <= 0:
+        return pd.Series(np.nan, index=high.index)
+
+    mu  = ((shares + vol) * high) / shares
+    lam = ((shares - vol) * low)  / shares
+    denom = mu - lam
+
+    eps = 1e-9 * np.nanmean(np.abs(denom))
+    valid = np.isfinite(denom) & (np.abs(denom) > eps)
+
+    out = np.full(len(high), np.nan)
+    out[valid] = (high.values[valid] - low.values[valid]) / denom.values[valid]
+    return pd.Series(out, index=high.index)
+
+
+def forward_realised_vol(ret, h):
+    return (
+        ret.shift(-1)[::-1]
+        .rolling(h, min_periods=max(2, int(0.8*h)))
+        .std()[::-1]
+    )
+
+
+def wma(series, window):
+    weights = np.arange(1, window+1)
+
+    def _calc(x):
+        x = np.asarray(x)
+        if np.isnan(x).all():
+            return np.nan
+        w = weights[-len(x):]
+        return np.dot(x, w) / w.sum()
+
+    return series.rolling(window, min_periods=max(2, window//2)).apply(_calc)
+
+
+def fast_spearman(x, y):
+    df = pd.concat([x, y], axis=1).dropna()
+    if len(df) < 5:
+        return np.nan
+    xr = df.iloc[:,0].rank()
+    yr = df.iloc[:,1].rank()
+    return np.corrcoef(xr, yr)[0,1]
+
+
+def bootstrap_ic(x, y):
+    df = pd.concat([x, y], axis=1).dropna()
+    if len(df) < 20:
+        return np.nan, {p: np.nan for p in BOOT_PCTS}, np.nan
+
+    xr = df.iloc[:,0].rank().values
+    yr = df.iloc[:,1].rank().values
+    n = len(xr)
+
+    vals = []
+    for _ in range(BOOT_ITERS):
+        idx = np.random.randint(0, n, n)
+        r = np.corrcoef(xr[idx], yr[idx])[0,1]
+        vals.append(r)
+
+    vals = np.array(vals)
+    return (
+        np.nanmean(vals),
+        {p: np.nanpercentile(vals, p) for p in BOOT_PCTS},
+        np.mean(vals > 0)
+    )
+
+
+# ===============================
+# Main evaluation
+# ===============================
+results = []
+
+end   = dt.datetime.utcnow()
+start = end - dt.timedelta(days=int(365.25 * TRAIN_YEARS))
+
+hist_all = yf.download(
+    TICKERS, start=start.date(), end=end.date(),
+    interval="1d", auto_adjust=True, group_by="ticker",
+    threads=True, progress=False
+)
+
+for sym in TICKERS:
+    try:
+        if sym not in hist_all.columns.get_level_values(0):
+            continue
+
+        df = hist_all[sym].copy()
+        df.columns = [c.capitalize() for c in df.columns]
+        df = df.reset_index()
+
+        df["ret"]    = df["Close"].pct_change()
+        df["absret"] = df["ret"].abs()
+
+        for w in STD_ROLL_WINDOWS:
+            df[f"roll_std{w}"] = df["ret"].rolling(w).std()
+
+        df["ATR14"] = atr14(df["High"], df["Low"], df["Close"])
+
+        shares = get_shares_outstanding(yf.Ticker(sym))
+        if not np.isfinite(shares):
+            continue
+
+        df["PCI2"] = compute_pci2(df["High"], df["Low"], df["Volume"], shares)
+
+        # Smooth PCI2 (WMA only retained)
+        smoothed = {
+            f"PCI2_wma{w}": wma(df["PCI2"], w)
+            for w in WMA_WINDOWS
+        }
+
+        for h in HORIZONS:
+            df[f"fwd_rvol{h}"] = forward_realised_vol(df["ret"], h)
+
+        # Walk-forward split
+        split = int(len(df) * 0.7)
+        test = df.iloc[split:]
+
+        for h in HORIZONS:
+            y = test[f"fwd_rvol{h}"]
+
+            for name, s in smoothed.items():
+                s_test = s.iloc[split:]
+
+                ic = fast_spearman(s_test, y)
+
+                if ENABLE_BOOTSTRAP:
+                    ic_b, pct_b, gt0 = bootstrap_ic(s_test, y)
+                else:
+                    ic_b, pct_b, gt0 = np.nan, {}, np.nan
+
+                results.append({
+                    "Symbol": sym,
+                    "Horizon": h,
+                    "Score": name,
+                    "IC": ic,
+                    "IC_boot_mean": ic_b,
+                    "IC_boot_gt0": gt0
+                })
+
+    except Exception as e:
+        print(f"[{sym}] error: {e}")
+
+# ===============================
+# Scorecard
+# ===============================
+res = pd.DataFrame(results)
+
+scorecard = (
+    res.groupby(["Horizon","Score"])
+       .agg(
+           IC_mean=("IC","mean"),
+           IC_median=("IC","median"),
+           bootIC_mean=("IC_boot_mean","mean"),
+           bootIC_gt0=("IC_boot_gt0","mean"),
+           N=("IC","count")
+       )
+       .reset_index()
+)
+
+print(scorecard.round(3))
