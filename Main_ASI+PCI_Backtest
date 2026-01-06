@@ -1,0 +1,1145 @@
+
+from __future__ import annotations
+
+# =============================
+# CONFIG
+# =============================
+
+START_DATE = "2000-01-01"
+END_DATE   = "2022-01-10"
+
+# Historical S&P 500 membership (ticker, start, end)
+SP500_TICKER_RANGES_URL = (
+    "https://raw.githubusercontent.com/fja05680/sp500/master/sp500_ticker_start_end.csv"
+)
+
+# ASI2 pairs
+ASI2_PAIR_LONG  = (15, 50)   # S15 / L50
+ASI2_PAIR_SHORT = (15, 50)
+
+# Cross-sectional selection fractions
+LONG_TOP_FRAC  = 0.01        # top X% go long
+SHORT_BOT_FRAC = 0.01       # bottom Y% go short
+
+# PCI smoothing
+PCI_WMA_WINDOW = 15          # WMA window
+
+# Ω-score parameters
+ASI_INDICE       = 2.0
+PCI_INDICE       = 2.0
+ASI_DENOMINATOR  = 1.0
+PCI_DENOMINATOR  = 3.0
+
+# ASI narrowing?
+ASI_NARROWING = True
+
+# Capital / allocations
+START_CAPITAL = 100_000.0
+LONG_ALLOC    = 1
+SHORT_ALLOC   = 0
+
+# Rebalancing
+REBAL_FREQ_DAYS = 14   # target spacing in trading days
+LAG_DAYS        = 1    # signals lagged by 1 trading day (Thu signal → Fri trade)
+
+# Rebalance weekday:
+#   - "Friday", "Mon", "Wednesday", etc., or integer 0=Mon,...,6=Sun
+#   - Set to None to use simple "every Nth trading day" instead
+REBAL_WEEKDAY   = "Friday"
+
+# Risk-free & annualization
+RF_ANNUAL = 0.03
+PERIODS_PER_YEAR = 252
+
+# Return clipping to avoid insane outliers from bad data
+MAX_ABS_DAILY_RETURN = 0.5   # ±50% per day cap
+
+# Minimum number of S&P members needed to form baseline on a given day
+MIN_UNIVERSE_COUNT = 50
+
+# Plot save
+SAVE_FIG = True
+FIG_PATH = "asi2_pci15_omega_ls_equity_vs_baseline.png"
+
+
+# =============================
+# IMPORTS
+# =============================
+import io
+import math
+import warnings
+import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# =============================
+# S&P 500 MEMBERSHIP
+# =============================
+
+def fetch_sp500_ticker_ranges(url: str) -> pd.DataFrame:
+    """
+    Fetch historical S&P 500 membership as ticker + start/end dates.
+
+    Expected CSV columns (case-insensitive, auto-detected):
+        - ticker/symbol
+        - start/startdate
+        - end/enddate
+    Returns DataFrame with:
+        ['ticker', 'start', 'end'] (datetimes, end inclusive).
+    """
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    df = pd.read_csv(io.StringIO(resp.text))
+
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # ticker
+    ticker_col = None
+    for key, col in cols_lower.items():
+        if key.startswith("ticker") or key.startswith("symbol"):
+            ticker_col = col
+            break
+    if ticker_col is None:
+        raise ValueError(f"Ticker column not found in {df.columns.tolist()}")
+
+    # start
+    start_col = None
+    for key, col in cols_lower.items():
+        if key.startswith("start"):
+            start_col = col
+            break
+    if start_col is None:
+        raise ValueError(f"Start date column not found in {df.columns.tolist()}")
+
+    # end
+    end_col = None
+    for key, col in cols_lower.items():
+        if key.startswith("end"):
+            end_col = col
+            break
+    if end_col is None:
+        raise ValueError(f"End date column not found in {df.columns.tolist()}")
+
+    out = pd.DataFrame({
+        "ticker": df[ticker_col].astype(str).str.upper(),
+        "start": pd.to_datetime(df[start_col]),
+        "end": pd.to_datetime(df[end_col], errors="coerce"),
+    })
+
+    # Missing end => “still in index”
+    out["end"] = out["end"].fillna(pd.Timestamp("2100-01-01"))
+
+    # Map some class share tickers to Yahoo style
+    mapping = {
+        "BRK.B": "BRK-B",
+        "BF.B": "BF-B",
+        "RDS.A": "RDS-A",
+        "RDS.B": "RDS-B",
+    }
+    out["ticker"] = out["ticker"].replace(mapping)
+
+    return out
+
+
+def build_membership_mask_from_ranges(
+    ranges: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """
+    Build boolean membership mask: index=dates, columns=tickers.
+
+    mask.loc[d, t] = True if start <= d <= end.
+    """
+    tickers = sorted(ranges["ticker"].unique())
+    mask = pd.DataFrame(False, index=dates, columns=tickers)
+
+    for _, row in ranges.iterrows():
+        t = row["ticker"]
+        s = row["start"]
+        e = row["end"]
+        if t not in mask.columns:
+            continue
+        idx = (dates >= s) & (dates <= e)
+        if idx.any():
+            mask.loc[idx, t] = True
+
+    return mask
+
+
+# =============================
+# MARKET DATA
+# =============================
+
+def fetch_ohlcv_adjclose(tickers, start, end):
+    """
+    Return (Adj Close, Close, High, Low, Volume)
+    All: DataFrames with columns=tickers, index=date.
+    """
+    raw = yf.download(
+        tickers=tickers,
+        start=start,
+        end=end,
+        auto_adjust=False,
+        group_by="ticker",
+        progress=False,
+        threads=True,
+        interval="1d",
+    )
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        adjs, closes, highs, lows, vols = [], [], [], [], []
+        top_level = set(raw.columns.get_level_values(0))
+        for t in tickers:
+            if t not in top_level:
+                continue
+            df_t = raw[t]
+            s_adj = df_t.get("Adj Close", df_t.get("Close"))
+            s_clo = df_t.get("Close", df_t.get("Adj Close"))
+            s_hi  = df_t.get("High")
+            s_lo  = df_t.get("Low")
+            s_vol = df_t.get("Volume")
+
+            adjs.append(s_adj.rename(t))
+            closes.append(s_clo.rename(t))
+            highs.append(s_hi.rename(t))
+            lows.append(s_lo.rename(t))
+            vols.append(s_vol.rename(t))
+
+        adj_close = pd.concat(adjs, axis=1).sort_index()
+        close     = pd.concat(closes, axis=1).sort_index()
+        high      = pd.concat(highs, axis=1).sort_index()
+        low       = pd.concat(lows, axis=1).sort_index()
+        volume    = pd.concat(vols, axis=1).sort_index()
+    else:
+        col_adj = "Adj Close" if "Adj Close" in raw.columns else "Close"
+        col_clo = "Close" if "Close" in raw.columns else col_adj
+        t0 = tickers[0]
+        adj_close = raw[[col_adj]].rename(columns={col_adj: t0}).sort_index()
+        close     = raw[[col_clo]].rename(columns={col_clo: t0}).sort_index()
+        high      = raw[["High"]].rename(columns={"High": t0}).sort_index()
+        low       = raw[["Low"]].rename(columns={"Low": t0}).sort_index()
+        volume    = raw[["Volume"]].rename(columns={"Volume": t0}).sort_index()
+
+    return adj_close, close, high, low, volume
+
+
+def get_shares_outstanding(symbol: str) -> float:
+    """
+    Shares outstanding from Yahoo. Returns NaN if unavailable.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        fi = getattr(ticker, "fast_info", None)
+        shares = None
+        if fi is not None and getattr(fi, "shares_outstanding", None):
+            shares = float(fi.shares_outstanding)
+        else:
+            info = ticker.info
+            shares = float(info.get("sharesOutstanding", 0) or 0)
+        if np.isfinite(shares) and shares > 0:
+            return shares
+    except Exception:
+        pass
+    return np.nan
+
+
+# =============================
+# PCI
+# =============================
+
+def compute_pci2(high: pd.Series, low: pd.Series, vol: pd.Series, shares: float) -> pd.Series:
+    """
+    PCI2 definition:
+
+        μ  = ((shares + vol) * high) / shares
+        λ  = ((shares - vol) * low)  / shares
+        PCI2 = (high - low) / (μ - λ)
+    """
+    if not np.isfinite(shares) or shares <= 0:
+        return pd.Series(np.nan, index=high.index)
+
+    mu  = ((shares + vol) * high) / shares
+    lam = ((shares - vol) * low)  / shares
+    denom = mu - lam
+
+    abs_denom = np.abs(denom.to_numpy(dtype=float))
+    mask = np.isfinite(abs_denom)
+    if mask.any():
+        mean_abs = abs_denom[mask].mean()
+        if not np.isfinite(mean_abs) or mean_abs == 0:
+            eps = 1e-9
+        else:
+            eps = 1e-9 * mean_abs
+    else:
+        eps = 1e-9
+
+    good = np.isfinite(denom) & (np.abs(denom) > eps)
+    out = np.full(len(high), np.nan, dtype=float)
+    hv, lv, dv = high.values, low.values, denom.values
+    out[good] = (hv[good] - lv[good]) / dv[good]
+    return pd.Series(out, index=high.index)
+
+
+def wma_series(x: pd.Series, window: int) -> pd.Series:
+    """
+    Weighted moving average, used for PCI smoothing.
+    """
+    if window <= 1:
+        return x.copy()
+    weights = np.arange(1, window + 1, dtype=float)
+
+    def _wavg(vals):
+        v = np.asarray(vals, dtype=float)
+        if np.isnan(v).all():
+            return np.nan
+        mask = np.isfinite(v)
+        if mask.sum() == 0:
+            return np.nan
+        w = weights[-mask.sum():]
+        return np.dot(v[mask], w) / w.sum()
+
+    return x.rolling(window, min_periods=max(2, window // 2)).apply(_wavg, raw=False)
+
+
+def compute_pci_panel(high: pd.DataFrame,
+                      low: pd.DataFrame,
+                      volume: pd.DataFrame,
+                      shares_map: dict[str, float],
+                      wma_window: int = 15) -> pd.DataFrame:
+    """
+    For each ticker:
+      - compute raw PCI2
+      - smooth with WMA(window)
+    """
+    cols = {}
+    for t in high.columns:
+        sh = shares_map.get(t, np.nan)
+        if not np.isfinite(sh) or sh <= 0:
+            cols[t] = pd.Series(np.nan, index=high.index)
+            continue
+        raw_pci = compute_pci2(high[t], low[t], volume[t], sh)
+        pci_smoothed = wma_series(raw_pci, wma_window)
+        cols[t] = pci_smoothed
+    return pd.DataFrame(cols, index=high.index)
+
+
+# =============================
+# ASI / ASI2
+# =============================
+
+def asi_from_window_fast(prices_1d: np.ndarray) -> float:
+    """
+    ASI = #positive / (#positive + #negative)
+    across all subperiod returns inside the window.
+    """
+    P = prices_1d.astype(float)
+    if P.size < 2 or np.any(~np.isfinite(P)):
+        return np.nan
+    R = (P[:, None] / P[None, :]) - 1.0
+    tri_mask = np.triu(np.ones_like(R, dtype=bool), k=1)
+    vals = R[tri_mask]
+    pos = np.count_nonzero(vals > 0)
+    neg = np.count_nonzero(vals < 0)
+    denom = pos + neg
+    return np.nan if denom == 0 else pos / denom
+
+
+def compute_asi_on_date(close_wide: pd.DataFrame, date: pd.Timestamp, lookbacks: list[int]) -> dict[int, pd.Series]:
+    """
+    Compute ASI for a set of lookbacks on ONE date across all tickers.
+    Returns {L: Series(index=tickers)}.
+    """
+    out = {}
+    try:
+        end_loc = close_wide.index.get_loc(date)
+    except KeyError:
+        for L in lookbacks:
+            out[L] = pd.Series(index=close_wide.columns, dtype=float)
+        return out
+
+    for L in sorted(set(lookbacks)):
+        if end_loc < L - 1:
+            out[L] = pd.Series(index=close_wide.columns, dtype=float)
+            continue
+        window = close_wide.iloc[end_loc - (L - 1): end_loc + 1]
+        vals = []
+        for t in close_wide.columns:
+            p = window[t].to_numpy()
+            if np.isnan(p).any():
+                vals.append(np.nan)
+            else:
+                vals.append(asi_from_window_fast(p))
+        out[L] = pd.Series(vals, index=close_wide.columns, dtype=float)
+    return out
+
+
+def build_asi2_on_rebalance_dates(close_wide: pd.DataFrame,
+                                  rebal_dates: pd.DatetimeIndex,
+                                  lag_days: int,
+                                  pair_long: tuple[int, int],
+                                  pair_short: tuple[int, int]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build ASI2 panels ONLY on the (lagged) rebalance dates.
+    """
+    needed = sorted({pair_long[0], pair_long[1], pair_short[0], pair_short[1]})
+    asi2_long_rows, asi2_short_rows = [], []
+    valid_index = []
+
+    for d in rebal_dates:
+        try:
+            loc = close_wide.index.get_loc(d)
+        except KeyError:
+            continue
+        lag_loc = loc - lag_days
+        if lag_loc < 0:
+            continue
+        d_sig = close_wide.index[lag_loc]
+        by_L = compute_asi_on_date(close_wide, d_sig, needed)
+
+        asi2_long_row = by_L.get(pair_long[0], pd.Series(index=close_wide.columns)) / \
+                        by_L.get(pair_long[1], pd.Series(index=close_wide.columns))
+        asi2_short_row = by_L.get(pair_short[0], pd.Series(index=close_wide.columns)) / \
+                         by_L.get(pair_short[1], pd.Series(index=close_wide.columns))
+
+        asi2_long_rows.append(asi2_long_row.rename(d))
+        asi2_short_rows.append(asi2_short_row.rename(d))
+        valid_index.append(d)
+
+    if not valid_index:
+        empty_index = pd.DatetimeIndex([], name="date")
+        return (pd.DataFrame(index=empty_index, columns=close_wide.columns, dtype=float),
+                pd.DataFrame(index=empty_index, columns=close_wide.columns, dtype=float))
+
+    asi2_long_df  = pd.DataFrame(asi2_long_rows)
+    asi2_short_df = pd.DataFrame(asi2_short_rows)
+    return asi2_long_df, asi2_short_df
+
+
+# =============================
+# GENERAL UTILITIES
+# =============================
+
+def sharpe_annualized(daily_returns: pd.Series, rf_annual: float = 0.0, periods_per_year: int = 252) -> float:
+    r = daily_returns.dropna()
+    if r.empty:
+        return float("nan")
+    rf_daily = (1.0 + rf_annual) ** (1.0 / periods_per_year) - 1.0
+    excess = r - rf_daily
+    sd = excess.std(ddof=1)
+    if sd == 0 or math.isnan(sd):
+        return float("nan")
+    return (excess.mean() / sd) * math.sqrt(periods_per_year)
+
+
+def compute_return_stats(
+    daily_returns: pd.Series,
+    rf_annual: float = 0.0,
+    periods_per_year: int = 252,
+) -> dict[str, float]:
+    """
+    Compute daily standard deviation, daily geometric mean and annualized Sharpe
+    for a series of daily returns.
+    """
+    r = daily_returns.dropna()
+    if r.empty:
+        return {
+            "std_daily": float("nan"),
+            "geo_daily": float("nan"),
+            "sharpe_annual": float("nan"),
+        }
+
+    # Daily standard deviation (arithmetic returns)
+    std_daily = r.std(ddof=1)
+
+    # Daily geometric mean: (Π (1+r))^(1/N) - 1
+    geo_daily = (1.0 + r).prod() ** (1.0 / len(r)) - 1.0
+
+    # Annualized Sharpe using existing helper
+    sharpe = sharpe_annualized(r, rf_annual=rf_annual, periods_per_year=periods_per_year)
+
+    return {
+        "std_daily": float(std_daily),
+        "geo_daily": float(geo_daily),
+        "sharpe_annual": float(sharpe),
+    }
+
+
+def max_drawdown(equity_curve: pd.Series) -> float:
+    ec = equity_curve.dropna()
+    if ec.empty:
+        return float("nan")
+    peak = ec.cummax()
+    dd = ec / peak - 1.0
+    return float(dd.min())
+
+
+def alpha_beta_excess(port_ret: pd.Series, mkt_ret: pd.Series,
+                      rf_annual: float, periods_per_year: int = 252):
+    rf_daily = (1.0 + rf_annual) ** (1.0 / periods_per_year) - 1.0
+    df = pd.concat([port_ret, mkt_ret], axis=1, join="inner").dropna()
+    if df.empty:
+        return np.nan, np.nan, np.nan
+    p = df.iloc[:, 0] - rf_daily
+    m = df.iloc[:, 1] - rf_daily
+    var_m = m.var(ddof=1)
+    if var_m == 0 or np.isnan(var_m):
+        return np.nan, np.nan, np.nan
+    cov_mp = np.cov(m, p, ddof=1)[0, 1]
+    beta = cov_mp / var_m
+    alpha_daily = p.mean() - beta * m.mean()
+    alpha_annual = (1.0 + alpha_daily) ** periods_per_year - 1.0
+    return float(alpha_annual), float(beta), float(alpha_daily)
+
+
+def _normalize_or_empty(w: pd.Series) -> pd.Series:
+    s = w.sum()
+    if s is None or not np.isfinite(s) or s <= 0:
+        return pd.Series(dtype=float)
+    return w / s
+
+
+def _equal_weight_index(idx: pd.Index) -> pd.Series:
+    if len(idx) == 0:
+        return pd.Series(dtype=float)
+    return pd.Series(1.0 / len(idx), index=idx, dtype=float)
+
+
+def _safe_power_and_normalize(series: pd.Series, power: float) -> pd.Series | None:
+    if series is None or series.empty:
+        return None
+    s = series.astype(float).replace([np.inf, -np.inf], np.nan)
+    s = s.clip(lower=0.0)
+    if s.isna().all():
+        return None
+    if power == 0:
+        s = pd.Series(1.0, index=s.index)
+    else:
+        s = s ** power
+    s = s.replace([np.inf, -np.inf], np.nan)
+    if s.isna().all():
+        return None
+    total = s.sum()
+    if not np.isfinite(total) or total <= 0:
+        return None
+    return s / total
+
+
+def compute_omega_series(asi_series: pd.Series,
+                         pci_series: pd.Series,
+                         asi_power: float,
+                         pci_power: float,
+                         asi_denominator: float,
+                         pci_denominator: float) -> pd.Series | None:
+    idx = asi_series.index.union(pci_series.index)
+    asi_norm = _safe_power_and_normalize(asi_series, asi_power)
+    pci_norm = _safe_power_and_normalize(pci_series, pci_power)
+
+    if asi_norm is None and pci_norm is None:
+        return None
+
+    if asi_norm is None:
+        asi_omega = pd.Series(0.0, index=idx)
+    else:
+        asi_omega = asi_norm.reindex(idx).fillna(0.0) / float(asi_denominator)
+
+    if pci_norm is None:
+        pci_omega = pd.Series(0.0, index=idx)
+    else:
+        pci_omega = pci_norm.reindex(idx).fillna(0.0) / float(pci_denominator)
+
+    omega = asi_omega.add(pci_omega, fill_value=0.0)
+    omega = omega.replace([np.inf, -np.inf], np.nan)
+
+    if omega.isna().all():
+        return None
+    return omega
+
+
+def sanitize_returns_df(df: pd.DataFrame,
+                        max_abs_return: float = MAX_ABS_DAILY_RETURN) -> pd.DataFrame:
+    """
+    Clip extreme daily returns to avoid insane compounding from bad data.
+    """
+    return df.clip(lower=-max_abs_return, upper=max_abs_return)
+
+
+def sanitize_returns_series(s: pd.Series,
+                            max_abs_return: float = MAX_ABS_DAILY_RETURN) -> pd.Series:
+    return s.clip(lower=-max_abs_return, upper=max_abs_return)
+
+
+# =============================
+# WEEKDAY LOGIC
+# =============================
+
+def _weekday_to_int(wd) -> int | None:
+    """
+    Convert weekday spec to integer:
+      - 0=Mon, 1=Tue, ..., 6=Sun
+      - Accepts 'Monday', 'Mon', 'fri', etc.
+      - If wd is None, returns None (no weekday restriction).
+    """
+    if wd is None:
+        return None
+    if isinstance(wd, int):
+        if 0 <= wd <= 6:
+            return wd
+        raise ValueError("rebal_weekday integer must be between 0 (Monday) and 6 (Sunday).")
+    wd_str = str(wd).strip().lower()
+    mapping = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+    if wd_str not in mapping:
+        raise ValueError(f"Unrecognized weekday: {wd!r}")
+    return mapping[wd_str]
+
+
+def compute_weekday_rebalance_dates(
+    all_dates: pd.DatetimeIndex,
+    rebalance_freq_days: int,
+    rebal_weekday_int: int,
+) -> pd.DatetimeIndex:
+    """
+    Build a sequence of rebalance dates restricted to a given weekday.
+
+    Logic:
+      1) First rebalance = first date whose weekday == rebal_weekday_int.
+      2) Each subsequent rebalance i:
+           - target index = last_rebal_index + rebalance_freq_days
+           - among FUTURE dates with that weekday, pick the one whose
+             index is closest to 'target index' (in trading days),
+             while strictly moving forward in time.
+    """
+    all_dates = pd.DatetimeIndex(all_dates)
+    if len(all_dates) == 0:
+        return all_dates[:0]
+
+    weekday_vals = all_dates.weekday
+    weekday_indices = np.where(weekday_vals == rebal_weekday_int)[0]
+    if len(weekday_indices) == 0:
+        raise ValueError("No trading days match the requested rebalance weekday in the date range.")
+
+    rebal_indices: list[int] = []
+
+    # First rebalance: first such weekday
+    first_idx = int(weekday_indices[0])
+    rebal_indices.append(first_idx)
+
+    # Subsequent rebalances
+    while True:
+        last_idx = rebal_indices[-1]
+        target_idx = last_idx + rebalance_freq_days
+        if target_idx >= len(all_dates):
+            break
+
+        future_wd = weekday_indices[weekday_indices > last_idx]
+        if len(future_wd) == 0:
+            break
+
+        closest_idx = int(future_wd[np.argmin(np.abs(future_wd - target_idx))])
+        if closest_idx >= len(all_dates):
+            break
+
+        rebal_indices.append(closest_idx)
+
+    rebal_indices = np.array(sorted(set(rebal_indices)), dtype=int)
+    return all_dates[rebal_indices]
+
+
+# =============================
+# CROSS-SECTION WEIGHTS
+# =============================
+
+def cross_section_long_weights(asi2_row: pd.Series,
+                               pci_row: pd.Series,
+                               top_frac: float,
+                               asi_power: float,
+                               pci_power: float,
+                               asi_denominator: float,
+                               pci_denominator: float,
+                               asi_narrowing: bool) -> pd.Series:
+    asi_clean = asi2_row.dropna()
+    pci_clean = pci_row.dropna()
+
+    if asi_narrowing:
+        if asi_clean.empty:
+            return pd.Series(dtype=float)
+        cutoff = asi_clean.quantile(1 - top_frac)
+        sel = asi_clean[asi_clean >= cutoff]
+        sel_idx = sel.index
+        if len(sel_idx) == 0:
+            return pd.Series(dtype=float)
+
+        asi_sel = asi2_row.reindex(sel_idx)
+        pci_sel = pci_row.reindex(sel_idx)
+        omega = compute_omega_series(
+            asi_sel, pci_sel,
+            asi_power=asi_power,
+            pci_power=pci_power,
+            asi_denominator=asi_denominator,
+            pci_denominator=pci_denominator,
+        )
+        if omega is None:
+            return _equal_weight_index(sel_idx)
+        omega = omega.reindex(sel_idx).fillna(0.0)
+        if omega.sum() <= 0 or omega.isna().all():
+            return _equal_weight_index(sel_idx)
+        return _normalize_or_empty(omega)
+
+    # no ASI narrowing
+    if asi_clean.empty and pci_clean.empty:
+        return pd.Series(dtype=float)
+
+    all_idx = asi2_row.index.union(pci_row.index)
+    asi_all = asi2_row.reindex(all_idx)
+    pci_all = pci_row.reindex(all_idx)
+
+    omega_all = compute_omega_series(
+        asi_all, pci_all,
+        asi_power=asi_power,
+        pci_power=pci_power,
+        asi_denominator=asi_denominator,
+        pci_denominator=pci_denominator,
+    )
+    if omega_all is None:
+        return _equal_weight_index(all_idx)
+
+    omega_all = omega_all.dropna()
+    if omega_all.empty:
+        return _equal_weight_index(all_idx)
+
+    cutoff = omega_all.quantile(1 - top_frac)
+    sel = omega_all[omega_all >= cutoff]
+    if sel.empty:
+        return _equal_weight_index(omega_all.index)
+    return _normalize_or_empty(sel)
+
+
+def cross_section_short_weights(asi2_row: pd.Series,
+                                pci_row: pd.Series,
+                                bot_frac: float,
+                                asi_power: float,
+                                pci_power: float,
+                                asi_denominator: float,
+                                pci_denominator: float,
+                                asi_narrowing: bool) -> pd.Series:
+    asi_clean = asi2_row.dropna()
+    pci_clean = pci_row.dropna()
+
+    if asi_narrowing:
+        if asi_clean.empty:
+            return pd.Series(dtype=float)
+        cutoff = asi_clean.quantile(bot_frac)
+        sel = asi_clean[asi_clean <= cutoff]
+        sel_idx = sel.index
+        if len(sel_idx) == 0:
+            return pd.Series(dtype=float)
+
+        asi_sel = asi2_row.reindex(sel_idx)
+        pci_sel = pci_row.reindex(sel_idx)
+        omega = compute_omega_series(
+            asi_sel, pci_sel,
+            asi_power=asi_power,
+            pci_power=pci_power,
+            asi_denominator=asi_denominator,
+            pci_denominator=pci_denominator,
+        )
+        if omega is None:
+            return _equal_weight_index(sel_idx)
+        omega = omega.reindex(sel_idx).fillna(0.0)
+        if omega.sum() <= 0 or omega.isna().all():
+            return _equal_weight_index(sel_idx)
+        return _normalize_or_empty(omega)
+
+    if asi_clean.empty and pci_clean.empty:
+        return pd.Series(dtype=float)
+
+    all_idx = asi2_row.index.union(pci_row.index)
+    asi_all = asi2_row.reindex(all_idx)
+    pci_all = pci_row.reindex(all_idx)
+
+    omega_all = compute_omega_series(
+        asi_all, pci_all,
+        asi_power=asi_power,
+        pci_power=pci_power,
+        asi_denominator=asi_denominator,
+        pci_denominator=pci_denominator,
+    )
+    if omega_all is None:
+        return _equal_weight_index(all_idx)
+
+    omega_all = omega_all.dropna()
+    if omega_all.empty:
+        return _equal_weight_index(all_idx)
+
+    cutoff = omega_all.quantile(bot_frac)
+    sel = omega_all[omega_all <= cutoff]
+    if sel.empty:
+        return _equal_weight_index(omega_all.index)
+    return _normalize_or_empty(sel)
+
+
+# =============================
+# BACKTEST
+# =============================
+
+def backtest_long_short_rebalance_only(
+    adj_close: pd.DataFrame,
+    close_for_asi: pd.DataFrame,
+    pci_panel: pd.DataFrame,
+    pair_long: tuple[int, int],
+    pair_short: tuple[int, int],
+    top_frac_long: float,
+    bot_frac_short: float,
+    long_alloc: float,
+    short_alloc: float,
+    rebalance_freq_days: int,
+    lag_days: int,
+    start_capital: float = 100_000.0,
+    rf_annual: float = 0.0,
+    periods_per_year: int = 252,
+    asi_indice: float = 2.0,
+    pci_indice: float = 2.0,
+    asi_denominator: float = 1.0,
+    pci_denominator: float = 1.0,
+    asi_narrowing: bool = True,
+    membership_mask: pd.DataFrame | None = None,
+    rebal_weekday=None,
+):
+    """
+    ASI2 + PCI Ω-score L/S backtest with point-in-time S&P 500 membership.
+
+    - ASI signals are lagged by `lag_days` (e.g. Thu signal → Fri rebalance).
+    - PCI panel is lagged by the same `lag_days` so PCI is also from the prior day.
+    """
+    # Daily returns
+    ret = adj_close.pct_change(fill_method=None)
+    ret = sanitize_returns_df(ret)
+
+    all_dates = ret.index
+    if len(all_dates) == 0:
+        raise ValueError("No return data available.")
+
+    # Membership & universe baseline
+    if membership_mask is not None:
+        membership_mask = membership_mask.reindex(index=all_dates, columns=ret.columns, fill_value=False)
+
+        counts = membership_mask.sum(axis=1)
+        mask_good = counts >= MIN_UNIVERSE_COUNT
+        membership_mask = membership_mask.where(mask_good, other=False)
+        ret = ret.where(mask_good, np.nan)
+
+        mkt_ret_all = ret.where(membership_mask).mean(axis=1, skipna=True)
+    else:
+        mkt_ret_all = ret.mean(axis=1, skipna=True)
+
+    mkt_ret_all = sanitize_returns_series(mkt_ret_all)
+
+    # Rebalance dates: either every Nth trading day or weekday-restricted
+    weekday_int = _weekday_to_int(rebal_weekday)
+    if weekday_int is None:
+        rebal_idx = np.arange(0, len(all_dates), rebalance_freq_days, dtype=int)
+        rebal_dates_all = all_dates[rebal_idx]
+    else:
+        rebal_dates_all = compute_weekday_rebalance_dates(
+            all_dates=all_dates,
+            rebalance_freq_days=rebalance_freq_days,
+            rebal_weekday_int=weekday_int,
+        )
+
+    # ASI2 on (lagged) rebalance dates
+    asi2_long_df, asi2_short_df = build_asi2_on_rebalance_dates(
+        close_wide=close_for_asi,
+        rebal_dates=rebal_dates_all,
+        lag_days=lag_days,
+        pair_long=pair_long,
+        pair_short=pair_short,
+    )
+
+    valid_rebals = asi2_long_df.index.intersection(asi2_short_df.index)
+    if len(valid_rebals) == 0:
+        raise ValueError("No valid rebalance dates after lag — not enough history.")
+
+    first_date = valid_rebals.min()
+    ret       = ret.loc[first_date:]
+    mkt_ret   = mkt_ret_all.loc[first_date:]
+
+    # Lag PCI by the same lag_days (e.g. Thu PCI for Fri trade)
+    pci_signal_panel = pci_panel.shift(lag_days)
+    pci_signal_panel = pci_signal_panel.loc[first_date:]
+
+    if membership_mask is not None:
+        membership_mask = membership_mask.loc[first_date:]
+
+    dates = ret.index
+    rebal_dates = pd.DatetimeIndex([d for d in valid_rebals if d in dates])
+
+    port_ret = pd.Series(0.0, index=dates)
+    long_weight_book, short_weight_book = {}, {}
+
+    for i, d in enumerate(rebal_dates):
+        # Holding window [d, d_next)
+        if i < len(rebal_dates) - 1:
+            d_next = rebal_dates[i + 1]
+            window = dates[(dates > d) & (dates <= d_next)] if i < len(rebal_dates)-1 else dates[dates > d]
+        else:
+            window = dates[dates >= d]
+        if window.empty:
+            continue
+
+        # Active S&P 500 members at rebalance date
+        if membership_mask is not None and d in membership_mask.index:
+            active_cols = membership_mask.columns[membership_mask.loc[d]]
+            if len(active_cols) == 0:
+                port_ret.loc[window] = 0.0
+                continue
+        else:
+            active_cols = ret.columns
+
+        row_long_full  = asi2_long_df.loc[d]  if d in asi2_long_df.index  else pd.Series(index=ret.columns, dtype=float)
+        row_short_full = asi2_short_df.loc[d] if d in asi2_short_df.index else pd.Series(index=ret.columns, dtype=float)
+        pci_row_full   = pci_signal_panel.loc[d] if d in pci_signal_panel.index else pd.Series(index=ret.columns, dtype=float)
+
+        row_long  = row_long_full.reindex(active_cols)
+        row_short = row_short_full.reindex(active_cols)
+        pci_row   = pci_row_full.reindex(active_cols)
+
+        # Weights
+        wL = cross_section_long_weights(
+            row_long,
+            pci_row,
+            top_frac=top_frac_long,
+            asi_power=asi_indice,
+            pci_power=pci_indice,
+            asi_denominator=asi_denominator,
+            pci_denominator=pci_denominator,
+            asi_narrowing=asi_narrowing,
+        )
+        wS = cross_section_short_weights(
+            row_short,
+            pci_row,
+            bot_frac=bot_frac_short,
+            asi_power=asi_indice,
+            pci_power=pci_indice,
+            asi_denominator=asi_denominator,
+            pci_denominator=pci_denominator,
+            asi_narrowing=asi_narrowing,
+        )
+
+        long_weight_book[d]  = wL
+        short_weight_book[d] = wS
+
+        # Basket returns over holding window
+        if not wL.empty:
+            rL = ret[wL.index].loc[window].fillna(0.0).mul(wL, axis=1).sum(axis=1)
+        else:
+            rL = pd.Series(0.0, index=window)
+
+        if not wS.empty:
+            rS = ret[wS.index].loc[window].fillna(0.0).mul(wS, axis=1).sum(axis=1)
+        else:
+            rS = pd.Series(0.0, index=window)
+
+        port_ret.loc[window] = long_alloc * rL - short_alloc * rS
+
+    equity      = (1.0 + port_ret.fillna(0.0)).cumprod() * start_capital
+    mkt_equity  = (1.0 + mkt_ret.fillna(0.0)).cumprod() * start_capital
+
+    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
+    ann_ret = (equity.iloc[-1] / equity.iloc[0]) ** (periods_per_year / max(1, len(equity))) - 1.0
+    sharpe_full = sharpe_annualized(port_ret, rf_annual=rf_annual, periods_per_year=periods_per_year)
+    mdd = max_drawdown(equity)
+
+    alpha_ann, beta, _ = alpha_beta_excess(port_ret, mkt_ret, rf_annual, periods_per_year)
+
+    # ============
+    # New stats (strategy & market, full period and last year)
+    # ============
+
+    # Full-period stats
+    strat_stats_full = compute_return_stats(
+        port_ret, rf_annual=rf_annual, periods_per_year=periods_per_year
+    )
+    mkt_stats_full = compute_return_stats(
+        mkt_ret, rf_annual=rf_annual, periods_per_year=periods_per_year
+    )
+
+    # Last "year" of backtest = last `periods_per_year` trading days
+    if len(port_ret.dropna()) >= periods_per_year:
+        port_last = port_ret.dropna().iloc[-periods_per_year:]
+    else:
+        port_last = port_ret.dropna()
+
+    if len(mkt_ret.dropna()) >= periods_per_year:
+        mkt_last = mkt_ret.dropna().iloc[-periods_per_year:]
+    else:
+        mkt_last = mkt_ret.dropna()
+
+    strat_stats_last = compute_return_stats(
+        port_last, rf_annual=rf_annual, periods_per_year=periods_per_year
+    )
+    mkt_stats_last = compute_return_stats(
+        mkt_last, rf_annual=rf_annual, periods_per_year=periods_per_year
+    )
+
+    summary = {
+        "Total Return %": total_return * 100.0,
+        "Ann. Return %": ann_ret * 100.0,
+        "Ann. Sharpe": sharpe_full,
+        "Max Drawdown %": mdd * 100.0,
+        "Alpha (annual %)": (alpha_ann * 100.0) if not np.isnan(alpha_ann) else np.nan,
+        "Beta vs Universe": beta,
+
+        "Start": str(dates.min().date()),
+        "End": str(dates.max().date()),
+        "Rebalance (days)": rebalance_freq_days,
+        "Rebalance Weekday": str(rebal_weekday),
+        "Long Alloc": long_alloc,
+        "Short Alloc": short_alloc,
+        "Long Pair": f"S{pair_long[0]}/L{pair_long[1]}",
+        "Short Pair": f"S{pair_short[0]}/L{pair_short[1]}",
+        "Top% Long": top_frac_long,
+        "Bot% Short": bot_frac_short,
+        "ASI Ω Power": asi_indice,
+        "PCI Ω Power": pci_indice,
+        "ASI Ω Denominator": asi_denominator,
+        "PCI Ω Denominator": pci_denominator,
+        "ASI Narrowing": asi_narrowing,
+        "PCI WMA Window": PCI_WMA_WINDOW,
+        "Max abs daily return clip": MAX_ABS_DAILY_RETURN,
+
+        # Strategy stats (full period)
+        "Strategy Daily Std (full)": strat_stats_full["std_daily"],
+        "Strategy Daily GeoMean % (full)": strat_stats_full["geo_daily"] * 100.0,
+        "Strategy Ann. Sharpe (full)": strat_stats_full["sharpe_annual"],
+
+        # Strategy stats (last year)
+        "Strategy Daily Std (last year)": strat_stats_last["std_daily"],
+        "Strategy Daily GeoMean % (last year)": strat_stats_last["geo_daily"] * 100.0,
+        "Strategy Ann. Sharpe (last year)": strat_stats_last["sharpe_annual"],
+
+        # Market / universe stats (full period)
+        "Market Daily Std (full)": mkt_stats_full["std_daily"],
+        "Market Daily GeoMean % (full)": mkt_stats_full["geo_daily"] * 100.0,
+        "Market Ann. Sharpe (full)": mkt_stats_full["sharpe_annual"],
+
+        # Market / universe stats (last year)
+        "Market Daily Std (last year)": mkt_stats_last["std_daily"],
+        "Market Daily GeoMean % (last year)": mkt_stats_last["geo_daily"] * 100.0,
+        "Market Ann. Sharpe (last year)": mkt_stats_last["sharpe_annual"],
+    }
+
+    return {
+        "daily_returns": port_ret,
+        "equity": equity,
+        "market_returns": mkt_ret,
+        "market_equity": mkt_equity,
+        "summary": summary,
+        "long_weights": long_weight_book,
+        "short_weights": short_weight_book,
+        "asi2_long_rows": asi2_long_df,
+        "asi2_short_rows": asi2_short_df,
+        "raw_returns": ret,
+    }
+
+
+# =============================
+# MAIN
+# =============================
+
+if __name__ == "__main__":
+    # 0) Historical membership
+    print("Downloading historical S&P 500 membership ranges...")
+    sp500_ranges = fetch_sp500_ticker_ranges(SP500_TICKER_RANGES_URL)
+    universe_tickers = sorted(sp500_ranges["ticker"].unique())
+    print(f"Universe tickers (from S&P 500 history): {len(universe_tickers)}")
+
+    # 1) OHLCV data
+    print("Downloading OHLCV from Yahoo Finance...")
+    adj_close, close, high, low, volume = fetch_ohlcv_adjclose(universe_tickers, START_DATE, END_DATE)
+
+    # membership mask aligned to trading days
+    print("Building point-in-time membership mask...")
+    membership_mask = build_membership_mask_from_ranges(sp500_ranges, adj_close.index)
+
+    # 2) Shares outstanding
+    print("Fetching shares outstanding (this may take a bit)...")
+    shares_map = {t: get_shares_outstanding(t) for t in adj_close.columns}
+    print("Sample shares_outstanding:", list(shares_map.items())[:5])
+
+    # 3) PCI
+    print("Computing PCI panel (smoothed)...")
+    pci_panel = compute_pci_panel(
+        high=high,
+        low=low,
+        volume=volume,
+        shares_map=shares_map,
+        wma_window=PCI_WMA_WINDOW,
+    )
+
+    # 4) Backtest
+    print("Running backtest...")
+    results = backtest_long_short_rebalance_only(
+        adj_close=adj_close,
+        close_for_asi=close,
+        pci_panel=pci_panel,
+        pair_long=ASI2_PAIR_LONG,
+        pair_short=ASI2_PAIR_SHORT,
+        top_frac_long=LONG_TOP_FRAC,
+        bot_frac_short=SHORT_BOT_FRAC,
+        long_alloc=LONG_ALLOC,
+        short_alloc=SHORT_ALLOC,
+        rebalance_freq_days=REBAL_FREQ_DAYS,
+        lag_days=LAG_DAYS,
+        start_capital=START_CAPITAL,
+        rf_annual=RF_ANNUAL,
+        periods_per_year=PERIODS_PER_YEAR,
+        asi_indice=ASI_INDICE,
+        pci_indice=PCI_INDICE,
+        asi_denominator=ASI_DENOMINATOR,
+        pci_denominator=PCI_DENOMINATOR,
+        asi_narrowing=ASI_NARROWING,
+        membership_mask=membership_mask,
+        rebal_weekday=REBAL_WEEKDAY,
+    )
+
+    # 5) Summary
+    print("\n=== Backtest Summary (ASI2 + PCI via Ω-score; PIT S&P 500) ===")
+    for k, v in results["summary"].items():
+        if isinstance(v, float):
+            if "Return" in k or "Drawdown" in k or "Alpha" in k or "GeoMean" in k:
+                print(f"{k:>36}: {v:10.2f}")
+            else:
+                print(f"{k:>36}: {v:10.4f}")
+        else:
+            print(f"{k:>36}: {v}")
+
+    # 6) Plot
+    plt.figure(figsize=(11, 5))
+    results["equity"].plot(label="ASI2 + PCI Ω L/S")
+    results["market_equity"].plot(label="S&P 500 Universe (EW)")
+    plt.title("Equity Curve — ASI2 + PCI Ω-Score vs S&P 500 (PIT Membership)")
+    plt.xlabel("Date")
+    plt.ylabel("Equity ($)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if SAVE_FIG:
+        plt.savefig(FIG_PATH, dpi=160)
+    plt.show()
+
+    # 7) Save CSVs
+    results["equity"].to_csv("asi2_pci15_omega_ls_equity.csv", header=["Equity"])
+    results["daily_returns"].to_csv("asi2_pci15_omega_ls_daily_returns.csv", header=["Daily Return"])
