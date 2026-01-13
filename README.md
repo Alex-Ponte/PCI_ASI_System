@@ -63,3 +63,5 @@ Open Questions & Future Work
   - Further investigation of option expiration effects
   - Testing the strategy across larger and international universes
   - Exploring higher-frequency ASI calculations (e.g. Hourly data)
+
+For a more detailed overview with ouputs and results see the file named PCI+ASI Research Doc FV.2.pdf
